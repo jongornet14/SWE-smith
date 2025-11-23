@@ -27,11 +27,21 @@ class TypeChangeModifier(PythonProceduralModifier):
     min_complexity: int = 3
 
     class Transformer(PythonProceduralModifier.Transformer):
+        def __init__(self, parent):
+            super().__init__(parent)
+            # Decide upfront which type of annotation to modify
+            choice = self.parent.rand.choice(["params", "return", "variable"])
+            self.modify_params = choice == "params"
+            self.modify_return = choice == "return"
+            self.modify_variable = choice == "variable"
+            self.param_modified = False
+        
         def leave_Param(
             self, original_node: libcst.Param, updated_node: libcst.Param
         ) -> libcst.Param:
             """Modify parameter type annotations."""
-            if not self.flip():
+            # Only modify if we chose params and haven't modified one yet
+            if not self.modify_params or self.param_modified:
                 return updated_node
             
             if updated_node.annotation is None:
@@ -44,6 +54,9 @@ class TypeChangeModifier(PythonProceduralModifier):
             if new_annotation is None:
                 return updated_node
             
+            # Mark that we've modified a parameter
+            self.param_modified = True
+            
             return updated_node.with_changes(
                 annotation=libcst.Annotation(annotation=new_annotation)
             )
@@ -52,7 +65,7 @@ class TypeChangeModifier(PythonProceduralModifier):
             self, original_node: libcst.FunctionDef, updated_node: libcst.FunctionDef
         ) -> libcst.FunctionDef:
             """Modify return type annotations."""
-            if not self.flip():
+            if not self.modify_return:
                 return updated_node
             
             if updated_node.returns is None:
@@ -71,7 +84,7 @@ class TypeChangeModifier(PythonProceduralModifier):
             self, original_node: libcst.AnnAssign, updated_node: libcst.AnnAssign
         ) -> libcst.AnnAssign:
             """Modify variable type annotations."""
-            if not self.flip():
+            if not self.modify_variable:
                 return updated_node
             
             if updated_node.annotation is None:
@@ -174,14 +187,25 @@ class TypeRemoveModifier(PythonProceduralModifier):
     min_complexity: int = 3
 
     class Transformer(PythonProceduralModifier.Transformer):
+        def __init__(self, parent):
+            super().__init__(parent)
+            # Decide upfront which type of annotation to remove
+            choice = self.parent.rand.choice(["params", "return", "variable"])
+            self.remove_params = choice == "params"
+            self.remove_return = choice == "return"
+            self.remove_variable = choice == "variable"
+            self.param_removed = False
+        
         def leave_Param(
             self, original_node: libcst.Param, updated_node: libcst.Param
         ) -> libcst.Param:
             """Remove parameter type annotations."""
-            if not self.flip():
+            # Only remove if we chose params and haven't removed one yet
+            if not self.remove_params or self.param_removed:
                 return updated_node
             
             if updated_node.annotation is not None:
+                self.param_removed = True
                 return updated_node.with_changes(annotation=None)
             
             return updated_node
@@ -190,7 +214,7 @@ class TypeRemoveModifier(PythonProceduralModifier):
             self, original_node: libcst.FunctionDef, updated_node: libcst.FunctionDef
         ) -> libcst.FunctionDef:
             """Remove return type annotations."""
-            if not self.flip():
+            if not self.remove_return:
                 return updated_node
             
             if updated_node.returns is not None:
@@ -202,7 +226,7 @@ class TypeRemoveModifier(PythonProceduralModifier):
             self, original_node: libcst.AnnAssign, updated_node: libcst.AnnAssign
         ) -> libcst.AnnAssign | libcst.Assign:
             """Convert annotated assignment to regular assignment."""
-            if not self.flip():
+            if not self.remove_variable:
                 return updated_node
             
             # Convert from annotated assignment to regular assignment
