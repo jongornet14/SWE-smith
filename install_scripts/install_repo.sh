@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-python -m ensurepip --user || true
-python -m pip install --user --upgrade pip
+python -m ensurepip || true
+python -m pip install --upgrade pip
 
-python -m pip install --user -r requirements.txt || true
-python -m pip install --user .
+python -m pip install -r requirements.txt || true
+python -m pip install .
