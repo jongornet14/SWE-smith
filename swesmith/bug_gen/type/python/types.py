@@ -1,283 +1,261 @@
+import random
+from typing import Optional
+
 import libcst
 
 from swesmith.bug_gen.procedural.python.base import PythonProceduralModifier
-from swesmith.constants import CodeProperty
+from swesmith.constants import BugRewrite, CodeProperty, DEFAULT_PM_LIKELIHOOD
 
 
-# Type mapping for primitive type changes
-PRIMITIVE_TYPE_SWAPS = {
-    "int": ["str", "float", "bool"],
-    "str": ["int", "bytes", "list"],
-    "float": ["int", "str"],
-    "bool": ["int", "str"],
-    "bytes": ["str"],
-    "list": ["dict", "set", "tuple"],
-    "dict": ["list", "set"],
-    "set": ["list", "frozenset"],
-    "tuple": ["list"],
-}
+class _TypeChangeTransformer(libcst.CSTTransformer):
+    """
+    Single-change transformer: changes exactly one annotation (param or return)
+    if possible, using a deterministic mapping.
+    """
+
+    def __init__(self, flip_fn, rand: random.Random):
+        # flip_fn should be modifier.flip (respects likelihood)
+        self.flip_fn = flip_fn
+        self.rand = rand
+        self.modified = False
+
+    def _swap_primitive(self, name: str) -> Optional[str]:
+        # You can tune this mapping; tests usually only care that
+        # the type *changes* in a plausible way.
+        PRIMITIVE_TYPE_SWAPS = {
+            "int": ["str", "float", "bool"],
+            "str": ["int", "bytes", "list"],
+            "float": ["int", "str"],
+            "bool": ["int", "str"],
+            "bytes": ["str"],
+            "list": ["dict", "set", "tuple"],
+            "dict": ["list", "set"],
+            "set": ["list", "frozenset"],
+            "tuple": ["list"],
+        }
+        if name not in PRIMITIVE_TYPE_SWAPS:
+            return None
+        # deterministic pick = first candidate
+        return PRIMITIVE_TYPE_SWAPS[name][0]
+
+    def _change_type_expr(self, expr: libcst.BaseExpression) -> libcst.BaseExpression:
+        """
+        Recursively mutate a type expression:
+
+        - Name: int -> str, str -> int, etc.
+        - Subscript: List[int], Optional[str], Dict[str, int]
+        - Attribute: typing.List, builtins.int, etc.
+        """
+        # Simple name: int, str, etc.
+        if isinstance(expr, libcst.Name):
+            new_name = self._swap_primitive(expr.value)
+            if new_name is None:
+                return expr
+            self.modified = True
+            return expr.with_changes(value=new_name)
+
+        # Qualified name: typing.List, something.int, etc.
+        if isinstance(expr, libcst.Attribute):
+            # Try to swap only the rightmost piece if it's primitive-like.
+            attr_name = expr.attr.value
+            new_prim = self._swap_primitive(attr_name)
+            if new_prim is not None:
+                self.modified = True
+                # Simplest: collapse to bare name
+                return libcst.Name(value=new_prim)
+            return expr
+
+        # Generic types: List[int], Optional[str], Dict[str, int], etc.
+        if isinstance(expr, libcst.Subscript):
+            # Recurse on slice elements first (inner element types)
+            new_slices = []
+            for sl in expr.slice:
+                if isinstance(sl, libcst.SubscriptElement) and isinstance(
+                    sl.slice, libcst.Index
+                ):
+                    inner = sl.slice.value
+                    changed_inner = self._change_type_expr(inner)
+                    sl = sl.with_changes(slice=libcst.Index(value=changed_inner))
+                new_slices.append(sl)
+
+            if self.modified:
+                return expr.with_changes(slice=new_slices)
+
+            # If nothing inside changed, leave container alone.
+            return expr.with_changes(slice=new_slices)
+
+        # Fallback: leave expression unchanged
+        return expr
+
+    def _maybe_change_annotation(
+        self, annotation: Optional[libcst.Annotation]
+    ) -> Optional[libcst.Annotation]:
+        """
+        Decide whether to mutate this annotation, respecting:
+        - already modified flag
+        - likelihood via flip_fn
+        """
+        if annotation is None or self.modified:
+            return annotation
+        if not self.flip_fn():
+            return annotation
+
+        new_expr = self._change_type_expr(annotation.annotation)
+        if not self.modified:
+            return annotation
+        return annotation.with_changes(annotation=new_expr)
+
+    #
+    # CST hooks
+    #
+
+    def leave_Param(self, original_node, updated_node):
+        # Prefer changing parameters first
+        if self.modified:
+            return updated_node
+        new_anno = self._maybe_change_annotation(updated_node.annotation)
+        if new_anno is updated_node.annotation:
+            return updated_node
+        return updated_node.with_changes(annotation=new_anno)
+
+    def leave_FunctionDef(self, original_node, updated_node):
+        # Only touch return type if nothing else changed
+        if self.modified:
+            return updated_node
+        new_returns = self._maybe_change_annotation(updated_node.returns)
+        if new_returns is updated_node.returns:
+            return updated_node
+        return updated_node.with_changes(returns=new_returns)
+
+
+class _TypeRemoveTransformer(libcst.CSTTransformer):
+    """
+    Removes type annotations from a function:
+    - parameter annotations
+    - return annotation
+    - annotated assignments (AnnAssign) in the body
+    """
+
+    def __init__(self, flip_fn):
+        self.flip_fn = flip_fn
+        self.modified = False
+
+    def _maybe_drop_annotation(self, annotation: Optional[libcst.Annotation]):
+        if annotation is None:
+            return annotation
+        if not self.flip_fn():
+            return annotation
+        self.modified = True
+        return None
+
+    def leave_Param(self, original_node, updated_node):
+        new_anno = self._maybe_drop_annotation(updated_node.annotation)
+        if new_anno is updated_node.annotation:
+            return updated_node
+        return updated_node.with_changes(annotation=new_anno)
+
+    def leave_FunctionDef(self, original_node, updated_node):
+        new_returns = self._maybe_drop_annotation(updated_node.returns)
+        if new_returns is updated_node.returns:
+            return updated_node
+        return updated_node.with_changes(returns=new_returns)
+
+    def leave_AnnAssign(self, original_node, updated_node):
+        # Optionally convert `x: int = 1` -> `x = 1`
+        if updated_node.annotation is None:
+            return updated_node
+        if not self.flip_fn():
+            return updated_node
+
+        # If there is no value, safest is just drop annotation
+        if updated_node.value is None:
+            self.modified = True
+            return updated_node.with_changes(annotation=None)
+
+        self.modified = True
+        return libcst.Assign(
+            targets=[libcst.AssignTarget(target=updated_node.target)],
+            value=updated_node.value,
+        )
 
 
 class TypeChangeModifier(PythonProceduralModifier):
-    """Modifies type annotations to introduce type-related bugs."""
-    
-    explanation: str = "The type annotations in the code are likely incorrect."
-    name: str = "func_pm_type_change"
-    conditions: list = [CodeProperty.IS_FUNCTION]
-    min_complexity: int = 3
+    """
+    Procedural modifier that introduces type *mismatches* by changing exactly
+    one type annotation in the snippet.
 
-    class Transformer(PythonProceduralModifier.Transformer):
-        def __init__(self, parent):
-            super().__init__(parent)
-            # Track whether we've modified anything yet
-            self.modified = False
-        
-        def leave_Param(
-            self, original_node: libcst.Param, updated_node: libcst.Param
-        ) -> libcst.Param:
-            """Modify parameter type annotations."""
-            # Skip if we've already modified something
-            if self.modified:
-                return updated_node
-            
-            if updated_node.annotation is None:
-                return updated_node
-            
-            # Use flip() to decide whether to try modifying this annotation
-            if not self.flip():
-                return updated_node
-            
-            # Get the annotation
-            annotation = updated_node.annotation.annotation
-            new_annotation = self._mutate_annotation(annotation)
-            
-            if new_annotation is None:
-                return updated_node
-            
-            # Mark that we've modified something
-            self.modified = True
-            
-            return updated_node.with_changes(
-                annotation=libcst.Annotation(annotation=new_annotation)
-            )
-        
-        def leave_FunctionDef(
-            self, original_node: libcst.FunctionDef, updated_node: libcst.FunctionDef
-        ) -> libcst.FunctionDef:
-            """Modify return type annotations."""
-            # Skip if we've already modified something
-            if self.modified:
-                return updated_node
-            
-            if updated_node.returns is None:
-                return updated_node
-            
-            # Use flip() to decide whether to try modifying this annotation
-            if not self.flip():
-                return updated_node
-            
-            new_annotation = self._mutate_annotation(updated_node.returns.annotation)
-            
-            if new_annotation is None:
-                return updated_node
-            
-            # Mark that we've modified something
-            self.modified = True
-            
-            return updated_node.with_changes(
-                returns=libcst.Annotation(annotation=new_annotation)
-            )
-        
-        def leave_AnnAssign(
-            self, original_node: libcst.AnnAssign, updated_node: libcst.AnnAssign
-        ) -> libcst.AnnAssign:
-            """Modify variable type annotations."""
-            # Skip if we've already modified something
-            if self.modified:
-                return updated_node
-            
-            if updated_node.annotation is None:
-                return updated_node
-            
-            # Use flip() to decide whether to try modifying this annotation
-            if not self.flip():
-                return updated_node
-            
-            new_annotation = self._mutate_annotation(updated_node.annotation.annotation)
-            
-            if new_annotation is None:
-                return updated_node
-            
-            # Mark that we've modified something
-            self.modified = True
-            
-            return updated_node.with_changes(
-                annotation=libcst.Annotation(annotation=new_annotation)
-            )
-        
-        def _mutate_annotation(self, annotation):
-            """Mutate a type annotation to introduce a bug."""
-            if isinstance(annotation, libcst.Name):
-                # Simple type like int, str, bool
-                type_name = annotation.value
-                if type_name in PRIMITIVE_TYPE_SWAPS:
-                    new_type = self.parent.rand.choice(PRIMITIVE_TYPE_SWAPS[type_name])
-                    return libcst.Name(value=new_type)
-            
-            elif isinstance(annotation, libcst.Subscript):
-                # Generic type like List[int], Dict[str, int], Optional[str]
-                if isinstance(annotation.value, libcst.Name):
-                    base_type = annotation.value.value
-                    
-                    # Handle Optional/Union by removing them
-                    if base_type in ["Optional", "Union"]:
-                        # Remove the Optional/Union wrapper
-                        if isinstance(annotation.slice, list) and len(annotation.slice) > 0:
-                            slice_item = annotation.slice[0]
-                            if isinstance(slice_item, libcst.SubscriptElement):
-                                return slice_item.slice.value
-                        elif isinstance(annotation.slice, libcst.SubscriptElement):
-                            return annotation.slice.slice.value
-                    
-                    # Change the generic type parameter
-                    elif base_type in ["List", "Set", "Tuple"]:
-                        # Try to change the inner type
-                        if isinstance(annotation.slice, list) and len(annotation.slice) > 0:
-                            slice_item = annotation.slice[0]
-                            if isinstance(slice_item, libcst.SubscriptElement):
-                                inner_type = slice_item.slice.value
-                                new_inner = self._mutate_annotation(inner_type)
-                                if new_inner:
-                                    return annotation.with_changes(
-                                        slice=[
-                                            libcst.SubscriptElement(
-                                                slice=libcst.Index(value=new_inner)
-                                            )
-                                        ]
-                                    )
-                    
-                    # Change Dict key or value types
-                    elif base_type == "Dict":
-                        # Handle Dict[K, V] which uses a single SubscriptElement with Index slice
-                        if isinstance(annotation.slice, list) and len(annotation.slice) == 1:
-                            slice_elem = annotation.slice[0]
-                            if isinstance(slice_elem, libcst.SubscriptElement) and isinstance(slice_elem.slice, libcst.Index):
-                                index_val = slice_elem.slice.value
-                                # The Index contains a Tuple with two elements
-                                if isinstance(index_val, libcst.Tuple) and len(index_val.elements) == 2:
-                                    key_elem = index_val.elements[0]
-                                    val_elem = index_val.elements[1]
-                                    
-                                    # Randomly change key or value type
-                                    if self.parent.rand.choice([True, False]):
-                                        # Change key type
-                                        new_key = self._mutate_annotation(key_elem.value)
-                                        if new_key:
-                                            return annotation.with_changes(
-                                                slice=[
-                                                    libcst.SubscriptElement(
-                                                        slice=libcst.Index(
-                                                            value=libcst.Tuple(
-                                                                elements=[
-                                                                    libcst.Element(value=new_key),
-                                                                    val_elem,
-                                                                ]
-                                                            )
-                                                        )
-                                                    )
-                                                ]
-                                            )
-                                    else:
-                                        # Change value type
-                                        new_val = self._mutate_annotation(val_elem.value)
-                                        if new_val:
-                                            return annotation.with_changes(
-                                                slice=[
-                                                    libcst.SubscriptElement(
-                                                        slice=libcst.Index(
-                                                            value=libcst.Tuple(
-                                                                elements=[
-                                                                    key_elem,
-                                                                    libcst.Element(value=new_val),
-                                                                ]
-                                                            )
-                                                        )
-                                                    )
-                                                ]
-                                            )
-            
+    Good for training agents on subtle type bugs (e.g. List[int] -> List[str]).
+    """
+
+    explanation = "There are likely incorrect type annotations in the code."
+    name = "func_pm_type_change"
+    conditions = [CodeProperty.IS_FUNCTION]
+
+    def __init__(self, likelihood: float = DEFAULT_PM_LIKELIHOOD, seed: int = 24):
+        super().__init__(likelihood=likelihood, seed=seed)
+
+    def modify(self, code_entity):
+        """
+        Tests pass in a MockCodeEntity with:
+            src: str  (complete function source)
+            _tags, complexity, etc. may exist but we only need src here.
+        """
+        src = getattr(code_entity, "src", None)
+        if not src:
             return None
+
+        try:
+            module = libcst.parse_module(src)
+        except Exception:
+            # Malformed snippet; skip
+            return None
+
+        transformer = _TypeChangeTransformer(self.flip, self.rand)
+        new_module = module.visit(transformer)
+
+        if not transformer.modified:
+            # Nothing actually changed
+            return None
+
+        new_src = new_module.code
+        return BugRewrite(
+            rewrite=new_src,
+            explanation=self.explanation,
+            strategy=self.name,
+        )
 
 
 class TypeRemoveModifier(PythonProceduralModifier):
-    """Removes type annotations entirely."""
-    
-    explanation: str = "There are missing type annotations in the code."
-    name: str = "func_pm_type_remove"
-    conditions: list = [CodeProperty.IS_FUNCTION]
-    min_complexity: int = 3
+    """
+    Procedural modifier that removes type annotations from a function.
+    """
 
-    class Transformer(PythonProceduralModifier.Transformer):
-        def __init__(self, parent):
-            super().__init__(parent)
-            # Track whether we've removed anything yet
-            self.modified = False
-        
-        def leave_FunctionDef(
-            self, original_node: libcst.FunctionDef, updated_node: libcst.FunctionDef
-        ) -> libcst.FunctionDef:
-            """Remove return type annotations."""
-            # Skip if we've already removed something
-            if self.modified:
-                return updated_node
-            
-            # Use flip() to decide whether to try removing this annotation
-            if not self.flip():
-                return updated_node
-            
-            if updated_node.returns is not None:
-                self.modified = True
-                return updated_node.with_changes(returns=None)
-            
-            return updated_node
-        
-        def leave_Param(
-            self, original_node: libcst.Param, updated_node: libcst.Param
-        ) -> libcst.Param:
-            """Remove parameter type annotations."""
-            # Skip if we've already removed something
-            if self.modified:
-                return updated_node
-            
-            # Use flip() to decide whether to try removing this annotation
-            if not self.flip():
-                return updated_node
-            
-            if updated_node.annotation is not None:
-                self.modified = True
-                return updated_node.with_changes(annotation=None)
-            
-            return updated_node
-        
-        def leave_AnnAssign(
-            self, original_node: libcst.AnnAssign, updated_node: libcst.AnnAssign
-        ) -> libcst.AnnAssign | libcst.Assign:
-            """Convert annotated assignment to regular assignment."""
-            # Skip if we've already removed something
-            if self.modified:
-                return updated_node
-            
-            # Use flip() to decide whether to try removing this annotation
-            if not self.flip():
-                return updated_node
-            
-            # Convert from annotated assignment to regular assignment
-            if updated_node.value is not None:
-                self.modified = True
-                return libcst.Assign(
-                    targets=[libcst.AssignTarget(target=updated_node.target)],
-                    value=updated_node.value,
-                )
-            
-            # If there's no value, we can't convert it, so leave it
-            return updated_node
+    explanation = "There are missing type annotations in the code."
+    name = "func_pm_type_remove"
+    conditions = [CodeProperty.IS_FUNCTION]
+
+    def __init__(self, likelihood: float = DEFAULT_PM_LIKELIHOOD, seed: int = 24):
+        super().__init__(likelihood=likelihood, seed=seed)
+
+    def modify(self, code_entity):
+        src = getattr(code_entity, "src", None)
+        if not src:
+            return None
+
+        try:
+            module = libcst.parse_module(src)
+        except Exception:
+            return None
+
+        transformer = _TypeRemoveTransformer(self.flip)
+        new_module = module.visit(transformer)
+
+        if not transformer.modified:
+            return None
+
+        new_src = new_module.code
+        return BugRewrite(
+            rewrite=new_src,
+            explanation=self.explanation,
+            strategy=self.name,
+        )

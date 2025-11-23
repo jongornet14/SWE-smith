@@ -1,261 +1,307 @@
-import random
-from typing import Optional
-
 import libcst
-
-from swesmith.bug_gen.procedural.python.base import PythonProceduralModifier
-from swesmith.constants import BugRewrite, CodeProperty, DEFAULT_PM_LIKELIHOOD
-
-
-class _TypeChangeTransformer(libcst.CSTTransformer):
-    """
-    Single-change transformer: changes exactly one annotation (param or return)
-    if possible, using a deterministic mapping.
-    """
-
-    def __init__(self, flip_fn, rand: random.Random):
-        # flip_fn should be modifier.flip (respects likelihood)
-        self.flip_fn = flip_fn
-        self.rand = rand
-        self.modified = False
-
-    def _swap_primitive(self, name: str) -> Optional[str]:
-        # You can tune this mapping; tests usually only care that
-        # the type *changes* in a plausible way.
-        PRIMITIVE_TYPE_SWAPS = {
-            "int": ["str", "float", "bool"],
-            "str": ["int", "bytes", "list"],
-            "float": ["int", "str"],
-            "bool": ["int", "str"],
-            "bytes": ["str"],
-            "list": ["dict", "set", "tuple"],
-            "dict": ["list", "set"],
-            "set": ["list", "frozenset"],
-            "tuple": ["list"],
-        }
-        if name not in PRIMITIVE_TYPE_SWAPS:
-            return None
-        # deterministic pick = first candidate
-        return PRIMITIVE_TYPE_SWAPS[name][0]
-
-    def _change_type_expr(self, expr: libcst.BaseExpression) -> libcst.BaseExpression:
-        """
-        Recursively mutate a type expression:
-
-        - Name: int -> str, str -> int, etc.
-        - Subscript: List[int], Optional[str], Dict[str, int]
-        - Attribute: typing.List, builtins.int, etc.
-        """
-        # Simple name: int, str, etc.
-        if isinstance(expr, libcst.Name):
-            new_name = self._swap_primitive(expr.value)
-            if new_name is None:
-                return expr
-            self.modified = True
-            return expr.with_changes(value=new_name)
-
-        # Qualified name: typing.List, something.int, etc.
-        if isinstance(expr, libcst.Attribute):
-            # Try to swap only the rightmost piece if it's primitive-like.
-            attr_name = expr.attr.value
-            new_prim = self._swap_primitive(attr_name)
-            if new_prim is not None:
-                self.modified = True
-                # Simplest: collapse to bare name
-                return libcst.Name(value=new_prim)
-            return expr
-
-        # Generic types: List[int], Optional[str], Dict[str, int], etc.
-        if isinstance(expr, libcst.Subscript):
-            # Recurse on slice elements first (inner element types)
-            new_slices = []
-            for sl in expr.slice:
-                if isinstance(sl, libcst.SubscriptElement) and isinstance(
-                    sl.slice, libcst.Index
-                ):
-                    inner = sl.slice.value
-                    changed_inner = self._change_type_expr(inner)
-                    sl = sl.with_changes(slice=libcst.Index(value=changed_inner))
-                new_slices.append(sl)
-
-            if self.modified:
-                return expr.with_changes(slice=new_slices)
-
-            # If nothing inside changed, leave container alone.
-            return expr.with_changes(slice=new_slices)
-
-        # Fallback: leave expression unchanged
-        return expr
-
-    def _maybe_change_annotation(
-        self, annotation: Optional[libcst.Annotation]
-    ) -> Optional[libcst.Annotation]:
-        """
-        Decide whether to mutate this annotation, respecting:
-        - already modified flag
-        - likelihood via flip_fn
-        """
-        if annotation is None or self.modified:
-            return annotation
-        if not self.flip_fn():
-            return annotation
-
-        new_expr = self._change_type_expr(annotation.annotation)
-        if not self.modified:
-            return annotation
-        return annotation.with_changes(annotation=new_expr)
-
-    #
-    # CST hooks
-    #
-
-    def leave_Param(self, original_node, updated_node):
-        # Prefer changing parameters first
-        if self.modified:
-            return updated_node
-        new_anno = self._maybe_change_annotation(updated_node.annotation)
-        if new_anno is updated_node.annotation:
-            return updated_node
-        return updated_node.with_changes(annotation=new_anno)
-
-    def leave_FunctionDef(self, original_node, updated_node):
-        # Only touch return type if nothing else changed
-        if self.modified:
-            return updated_node
-        new_returns = self._maybe_change_annotation(updated_node.returns)
-        if new_returns is updated_node.returns:
-            return updated_node
-        return updated_node.with_changes(returns=new_returns)
+import pytest
+from swesmith.bug_gen.type.python.types import (
+    TypeChangeModifier,
+    TypeRemoveModifier,
+)
 
 
-class _TypeRemoveTransformer(libcst.CSTTransformer):
-    """
-    Removes type annotations from a function:
-    - parameter annotations
-    - return annotation
-    - annotated assignments (AnnAssign) in the body
-    """
+@pytest.mark.parametrize(
+    "src,expected_variants",
+    [
+        # Case 1: Change simple parameter type
+        (
+            """
+def foo(x: int) -> int:
+    return x + 1
+""",
+            [
+                "def foo(x: str) -> int:\n    return x + 1\n",
+                "def foo(x: float) -> int:\n    return x + 1\n",
+                "def foo(x: bool) -> int:\n    return x + 1\n",
+            ],
+        ),
+        # Case 2: Change return type
+        (
+            """
+def bar(x: int) -> str:
+    return str(x)
+""",
+            [
+                "def bar(x: int) -> int:\n    return str(x)\n",
+                "def bar(x: int) -> bytes:\n    return str(x)\n",
+                "def bar(x: int) -> list:\n    return str(x)\n",
+            ],
+        ),
+        # Case 3: Change List generic parameter
+        (
+            """
+def baz(items: List[int]) -> None:
+    pass
+""",
+            [
+                "def baz(items: List[str]) -> None:\n    pass\n",
+                "def baz(items: List[float]) -> None:\n    pass\n",
+                "def baz(items: List[bool]) -> None:\n    pass\n",
+            ],
+        ),
+        # Case 4: Remove Optional wrapper
+        (
+            """
+def qux(value: Optional[str]) -> None:
+    pass
+""",
+            [
+                "def qux(value: str) -> None:\n    pass\n",
+            ],
+        ),
+        # Case 5: Change Dict key type
+        (
+            """
+def process(data: Dict[str, int]) -> None:
+    pass
+""",
+            [
+                "def process(data: Dict[int, int]) -> None:\n    pass\n",
+                "def process(data: Dict[bytes, int]) -> None:\n    pass\n",
+                "def process(data: Dict[list, int]) -> None:\n    pass\n",
+            ],
+        ),
+        # Case 6: Change Dict value type
+        (
+            """
+def process(data: Dict[str, int]) -> None:
+    pass
+""",
+            [
+                "def process(data: Dict[str, str]) -> None:\n    pass\n",
+                "def process(data: Dict[str, float]) -> None:\n    pass\n",
+                "def process(data: Dict[str, bool]) -> None:\n    pass\n",
+            ],
+        ),
+        # Case 7: Variable annotation
+        (
+            """
+def foo():
+    x: int = 5
+    return x
+""",
+            [
+                "def foo():\n    x: str = 5\n    return x\n",
+                "def foo():\n    x: float = 5\n    return x\n",
+                "def foo():\n    x: bool = 5\n    return x\n",
+            ],
+        ),
+        # Case 8: No annotations, should not change
+        (
+            """
+def foo(x):
+    return x + 1
+""",
+            [
+                "def foo(x):\n    return x + 1\n",
+            ],
+        ),
+    ],
+)
+def test_type_change_modifier(src, expected_variants):
+    """Test that TypeChangeModifier correctly changes type annotations."""
+    module = libcst.parse_module(src)
+    modifier = TypeChangeModifier(likelihood=1.0, seed=42)
+    transformer = modifier.Transformer(modifier)
+    modified = module.visit(transformer)
+    result = modified.code
+    
+    # Check if the result matches any of the expected variants
+    assert any(result.strip() == variant.strip() for variant in expected_variants), (
+        f"Got: {result!r}, expected one of: {expected_variants!r}"
+    )
 
-    def __init__(self, flip_fn):
-        self.flip_fn = flip_fn
-        self.modified = False
 
-    def _maybe_drop_annotation(self, annotation: Optional[libcst.Annotation]):
-        if annotation is None:
-            return annotation
-        if not self.flip_fn():
-            return annotation
-        self.modified = True
-        return None
-
-    def leave_Param(self, original_node, updated_node):
-        new_anno = self._maybe_drop_annotation(updated_node.annotation)
-        if new_anno is updated_node.annotation:
-            return updated_node
-        return updated_node.with_changes(annotation=new_anno)
-
-    def leave_FunctionDef(self, original_node, updated_node):
-        new_returns = self._maybe_drop_annotation(updated_node.returns)
-        if new_returns is updated_node.returns:
-            return updated_node
-        return updated_node.with_changes(returns=new_returns)
-
-    def leave_AnnAssign(self, original_node, updated_node):
-        # Optionally convert `x: int = 1` -> `x = 1`
-        if updated_node.annotation is None:
-            return updated_node
-        if not self.flip_fn():
-            return updated_node
-
-        # If there is no value, safest is just drop annotation
-        if updated_node.value is None:
-            self.modified = True
-            return updated_node.with_changes(annotation=None)
-
-        self.modified = True
-        return libcst.Assign(
-            targets=[libcst.AssignTarget(target=updated_node.target)],
-            value=updated_node.value,
-        )
-
-
-class TypeChangeModifier(PythonProceduralModifier):
-    """
-    Procedural modifier that introduces type *mismatches* by changing exactly
-    one type annotation in the snippet.
-
-    Good for training agents on subtle type bugs (e.g. List[int] -> List[str]).
-    """
-
-    explanation = "There are likely incorrect type annotations in the code."
-    name = "func_pm_type_change"
-    conditions = [CodeProperty.IS_FUNCTION]
-
-    def __init__(self, likelihood: float = DEFAULT_PM_LIKELIHOOD, seed: int = 24):
-        super().__init__(likelihood=likelihood, seed=seed)
-
-    def modify(self, code_entity):
-        """
-        Tests pass in a MockCodeEntity with:
-            src: str  (complete function source)
-            _tags, complexity, etc. may exist but we only need src here.
-        """
-        src = getattr(code_entity, "src", None)
-        if not src:
-            return None
-
-        try:
-            module = libcst.parse_module(src)
-        except Exception:
-            # Malformed snippet; skip
-            return None
-
-        transformer = _TypeChangeTransformer(self.flip, self.rand)
-        new_module = module.visit(transformer)
-
-        if not transformer.modified:
-            # Nothing actually changed
-            return None
-
-        new_src = new_module.code
-        return BugRewrite(
-            rewrite=new_src,
-            explanation=self.explanation,
-            strategy=self.name,
-        )
+@pytest.mark.parametrize(
+    "src,expected_variants",
+    [
+        # Case 1: Remove parameter annotation
+        (
+            """
+def foo(x: int) -> int:
+    return x + 1
+""",
+            [
+                "def foo(x) -> int:\n    return x + 1\n",
+            ],
+        ),
+        # Case 2: Remove return type annotation
+        (
+            """
+def bar(x: int) -> str:
+    return str(x)
+""",
+            [
+                "def bar(x: int):\n    return str(x)\n",
+            ],
+        ),
+        # Case 3: Remove both parameter and return annotations
+        (
+            """
+def baz(x: int, y: str) -> bool:
+    return len(y) > x
+""",
+            [
+                "def baz(x, y: str) -> bool:\n    return len(y) > x\n",
+                "def baz(x: int, y) -> bool:\n    return len(y) > x\n",
+                "def baz(x: int, y: str):\n    return len(y) > x\n",
+            ],
+        ),
+        # Case 4: Convert annotated assignment to regular assignment
+        (
+            """
+def foo():
+    x: int = 5
+    return x
+""",
+            [
+                "def foo():\n    x = 5\n    return x\n",
+            ],
+        ),
+        # Case 5: Multiple parameter annotations
+        (
+            """
+def process(a: int, b: str, c: float) -> None:
+    pass
+""",
+            [
+                "def process(a, b: str, c: float) -> None:\n    pass\n",
+                "def process(a: int, b, c: float) -> None:\n    pass\n",
+                "def process(a: int, b: str, c) -> None:\n    pass\n",
+                "def process(a: int, b: str, c: float):\n    pass\n",
+            ],
+        ),
+        # Case 6: No annotations, should not change
+        (
+            """
+def foo(x):
+    return x + 1
+""",
+            [
+                "def foo(x):\n    return x + 1\n",
+            ],
+        ),
+    ],
+)
+def test_type_remove_modifier(src, expected_variants):
+    """Test that TypeRemoveModifier correctly removes type annotations."""
+    module = libcst.parse_module(src)
+    modifier = TypeRemoveModifier(likelihood=1.0, seed=42)
+    transformer = modifier.Transformer(modifier)
+    modified = module.visit(transformer)
+    result = modified.code
+    
+    # Check if the result matches any of the expected variants
+    assert any(result.strip() == variant.strip() for variant in expected_variants), (
+        f"Got: {result!r}, expected one of: {expected_variants!r}"
+    )
 
 
-class TypeRemoveModifier(PythonProceduralModifier):
-    """
-    Procedural modifier that removes type annotations from a function.
-    """
+def test_type_change_with_low_likelihood():
+    """Test that TypeChangeModifier respects likelihood parameter."""
+    src = """
+def foo(x: int, y: int, z: int) -> int:
+    return x + y + z
+"""
+    module = libcst.parse_module(src)
+    # With likelihood=0, nothing should change
+    modifier = TypeChangeModifier(likelihood=0.0, seed=42)
+    transformer = modifier.Transformer(modifier)
+    modified = module.visit(transformer)
+    
+    assert modified.code == src
 
-    explanation = "There are missing type annotations in the code."
-    name = "func_pm_type_remove"
-    conditions = [CodeProperty.IS_FUNCTION]
 
-    def __init__(self, likelihood: float = DEFAULT_PM_LIKELIHOOD, seed: int = 24):
-        super().__init__(likelihood=likelihood, seed=seed)
+def test_type_remove_with_low_likelihood():
+    """Test that TypeRemoveModifier respects likelihood parameter."""
+    src = """
+def foo(x: int, y: int) -> int:
+    return x + y
+"""
+    module = libcst.parse_module(src)
+    # With likelihood=0, nothing should change
+    modifier = TypeRemoveModifier(likelihood=0.0, seed=42)
+    transformer = modifier.Transformer(modifier)
+    modified = module.visit(transformer)
+    
+    assert modified.code == src
 
-    def modify(self, code_entity):
-        src = getattr(code_entity, "src", None)
-        if not src:
-            return None
 
-        try:
-            module = libcst.parse_module(src)
-        except Exception:
-            return None
+def test_type_change_complex_types():
+    """Test TypeChangeModifier with complex nested types."""
+    src = """
+def foo(items: List[Dict[str, int]]) -> Optional[str]:
+    return None
+"""
+    module = libcst.parse_module(src)
+    modifier = TypeChangeModifier(likelihood=1.0, seed=42)
+    transformer = modifier.Transformer(modifier)
+    modified = module.visit(transformer)
+    
+    # Should produce some change
+    assert modified.code != src
 
-        transformer = _TypeRemoveTransformer(self.flip)
-        new_module = module.visit(transformer)
 
-        if not transformer.modified:
-            return None
+def test_type_change_modifier_via_modify_method():
+    """Test using the full modify() method instead of just the transformer."""
+    from swesmith.constants import CodeEntity, CodeProperty
+    
+    src_code = """def add(x: int, y: int) -> int:
+    return x + y
+"""
+    
+    # Create a mock CodeEntity
+    class MockCodeEntity:
+        def __init__(self, src_code):
+            self.src_code = src_code
+            self._tags = {CodeProperty.IS_FUNCTION}
+            self.complexity = 5
+    
+    entity = MockCodeEntity(src_code)
+    modifier = TypeChangeModifier(likelihood=1.0, seed=42)
+    
+    # Check that entity passes the can_change check
+    assert modifier.can_change(entity)
+    
+    # Apply the modifier
+    result = modifier.modify(entity)
+    
+    # Should produce a BugRewrite
+    assert result is not None
+    assert result.rewrite != src_code
+    assert result.explanation == "The type annotations in the code are likely incorrect."
+    assert result.strategy == "func_pm_type_change"
 
-        new_src = new_module.code
-        return BugRewrite(
-            rewrite=new_src,
-            explanation=self.explanation,
-            strategy=self.name,
-        )
+
+def test_type_remove_modifier_via_modify_method():
+    """Test TypeRemoveModifier using the full modify() method."""
+    from swesmith.constants import CodeEntity, CodeProperty
+    
+    src_code = """def add(x: int, y: int) -> int:
+    return x + y
+"""
+    
+    # Create a mock CodeEntity
+    class MockCodeEntity:
+        def __init__(self, src_code):
+            self.src_code = src_code
+            self._tags = {CodeProperty.IS_FUNCTION}
+            self.complexity = 5
+    
+    entity = MockCodeEntity(src_code)
+    modifier = TypeRemoveModifier(likelihood=1.0, seed=42)
+    
+    # Apply the modifier
+    result = modifier.modify(entity)
+    
+    # Should produce a BugRewrite
+    assert result is not None
+    assert result.rewrite != src_code
+    assert result.explanation == "There are missing type annotations in the code."
+    assert result.strategy == "func_pm_type_remove"
