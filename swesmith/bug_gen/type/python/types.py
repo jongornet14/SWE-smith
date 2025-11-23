@@ -40,11 +40,11 @@ class TypeChangeModifier(PythonProceduralModifier):
             if self.modified:
                 return updated_node
             
-            # Use flip() to decide whether to try modifying this annotation
-            if not self.flip():
+            if updated_node.annotation is None:
                 return updated_node
             
-            if updated_node.annotation is None:
+            # Use flip() to decide whether to try modifying this annotation
+            if not self.flip():
                 return updated_node
             
             # Get the annotation
@@ -69,11 +69,11 @@ class TypeChangeModifier(PythonProceduralModifier):
             if self.modified:
                 return updated_node
             
-            # Use flip() to decide whether to try modifying this annotation
-            if not self.flip():
+            if updated_node.returns is None:
                 return updated_node
             
-            if updated_node.returns is None:
+            # Use flip() to decide whether to try modifying this annotation
+            if not self.flip():
                 return updated_node
             
             new_annotation = self._mutate_annotation(updated_node.returns.annotation)
@@ -96,11 +96,11 @@ class TypeChangeModifier(PythonProceduralModifier):
             if self.modified:
                 return updated_node
             
-            # Use flip() to decide whether to try modifying this annotation
-            if not self.flip():
+            if updated_node.annotation is None:
                 return updated_node
             
-            if updated_node.annotation is None:
+            # Use flip() to decide whether to try modifying this annotation
+            if not self.flip():
                 return updated_node
             
             new_annotation = self._mutate_annotation(updated_node.annotation.annotation)
@@ -158,38 +158,53 @@ class TypeChangeModifier(PythonProceduralModifier):
                     
                     # Change Dict key or value types
                     elif base_type == "Dict":
-                        if isinstance(annotation.slice, list) and len(annotation.slice) >= 2:
-                            # Randomly change key or value type
-                            if self.parent.rand.choice([True, False]):
-                                # Change key type
-                                key_item = annotation.slice[0]
-                                if isinstance(key_item, libcst.SubscriptElement):
-                                    key_type = key_item.slice.value
-                                    new_key = self._mutate_annotation(key_type)
-                                    if new_key:
-                                        return annotation.with_changes(
-                                            slice=[
-                                                libcst.SubscriptElement(
-                                                    slice=libcst.Index(value=new_key)
-                                                ),
-                                                annotation.slice[1],
-                                            ]
-                                        )
-                            else:
-                                # Change value type
-                                val_item = annotation.slice[1]
-                                if isinstance(val_item, libcst.SubscriptElement):
-                                    val_type = val_item.slice.value
-                                    new_val = self._mutate_annotation(val_type)
-                                    if new_val:
-                                        return annotation.with_changes(
-                                            slice=[
-                                                annotation.slice[0],
-                                                libcst.SubscriptElement(
-                                                    slice=libcst.Index(value=new_val)
-                                                ),
-                                            ]
-                                        )
+                        # Handle Dict[K, V] which uses a single SubscriptElement with Index slice
+                        if isinstance(annotation.slice, list) and len(annotation.slice) == 1:
+                            slice_elem = annotation.slice[0]
+                            if isinstance(slice_elem, libcst.SubscriptElement) and isinstance(slice_elem.slice, libcst.Index):
+                                index_val = slice_elem.slice.value
+                                # The Index contains a Tuple with two elements
+                                if isinstance(index_val, libcst.Tuple) and len(index_val.elements) == 2:
+                                    key_elem = index_val.elements[0]
+                                    val_elem = index_val.elements[1]
+                                    
+                                    # Randomly change key or value type
+                                    if self.parent.rand.choice([True, False]):
+                                        # Change key type
+                                        new_key = self._mutate_annotation(key_elem.value)
+                                        if new_key:
+                                            return annotation.with_changes(
+                                                slice=[
+                                                    libcst.SubscriptElement(
+                                                        slice=libcst.Index(
+                                                            value=libcst.Tuple(
+                                                                elements=[
+                                                                    libcst.Element(value=new_key),
+                                                                    val_elem,
+                                                                ]
+                                                            )
+                                                        )
+                                                    )
+                                                ]
+                                            )
+                                    else:
+                                        # Change value type
+                                        new_val = self._mutate_annotation(val_elem.value)
+                                        if new_val:
+                                            return annotation.with_changes(
+                                                slice=[
+                                                    libcst.SubscriptElement(
+                                                        slice=libcst.Index(
+                                                            value=libcst.Tuple(
+                                                                elements=[
+                                                                    key_elem,
+                                                                    libcst.Element(value=new_val),
+                                                                ]
+                                                            )
+                                                        )
+                                                    )
+                                                ]
+                                            )
             
             return None
 
@@ -208,24 +223,6 @@ class TypeRemoveModifier(PythonProceduralModifier):
             # Track whether we've removed anything yet
             self.modified = False
         
-        def leave_Param(
-            self, original_node: libcst.Param, updated_node: libcst.Param
-        ) -> libcst.Param:
-            """Remove parameter type annotations."""
-            # Skip if we've already removed something
-            if self.modified:
-                return updated_node
-            
-            # Use flip() to decide whether to try removing this annotation
-            if not self.flip():
-                return updated_node
-            
-            if updated_node.annotation is not None:
-                self.modified = True
-                return updated_node.with_changes(annotation=None)
-            
-            return updated_node
-        
         def leave_FunctionDef(
             self, original_node: libcst.FunctionDef, updated_node: libcst.FunctionDef
         ) -> libcst.FunctionDef:
@@ -241,6 +238,24 @@ class TypeRemoveModifier(PythonProceduralModifier):
             if updated_node.returns is not None:
                 self.modified = True
                 return updated_node.with_changes(returns=None)
+            
+            return updated_node
+        
+        def leave_Param(
+            self, original_node: libcst.Param, updated_node: libcst.Param
+        ) -> libcst.Param:
+            """Remove parameter type annotations."""
+            # Skip if we've already removed something
+            if self.modified:
+                return updated_node
+            
+            # Use flip() to decide whether to try removing this annotation
+            if not self.flip():
+                return updated_node
+            
+            if updated_node.annotation is not None:
+                self.modified = True
+                return updated_node.with_changes(annotation=None)
             
             return updated_node
         
